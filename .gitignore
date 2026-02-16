@@ -174,3 +174,7 @@ venv/
 __pycache__/
 *.pyc
 .env
+
+# Stock Trading System - Secret configs
+config/settings.local.yaml
+config/gcp-service-account.json

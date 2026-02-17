@@ -109,6 +109,18 @@ broker:
 | `analysis.signal.sell_threshold` | -0.6 | 매도 신호 임계값 |
 | `analysis.sentiment.phase` | 1 | 감성 분석 단계 (1=키워드, 2=LLM) |
 
+### LangGraph
+
+| 설정 | 기본값 | 설명 |
+|------|--------|------|
+| `langgraph.checkpoint.backend` | sqlite | 체크포인터 백엔드 (sqlite/postgres) |
+| `langgraph.analysis_graph.enabled` | true | 분석 엔진 LangGraph 활성화 |
+| `langgraph.analysis_graph.agent_timeout_ms` | 3000 | Agent 노드 타임아웃 (ms) |
+| `langgraph.analysis_graph.llm_model` | haiku | Agent 호출 LLM 모델 |
+| `langgraph.briefing_graph.enabled` | true | 장전 브리핑 LangGraph 활성화 |
+| `langgraph.sell_approval_graph.enabled` | true | 매도 승인 워크플로우 활성화 |
+| `langgraph.sell_approval_graph.approval_timeout_hours` | 48 | 승인 대기 최대 시간 |
+
 ## 환경별 설정 오버라이드
 
 ```python

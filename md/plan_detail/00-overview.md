@@ -23,9 +23,10 @@ AI 분석 기반으로 매수/매도/관망 신호를 생성하는 투자 의사
 | 배치 버퍼 | Cloud Storage | $0 (5GB 무료) |
 | 알림 | Telegram Bot | $0 |
 | 언어 | Python 3.11+ | — |
+| Agent 오케스트레이션 | LangGraph + LangChain | $0 (OSS) |
 | 모니터링 | Prometheus + Grafana Cloud | $0 |
 
-**MVP 월 비용: $0**
+**MVP 월 비용: $0** (LLM API 비용은 `llm.daily_budget_usd`로 별도 관리)
 
 ## 파일 구조
 
@@ -41,10 +42,17 @@ md/plan_detail/
 ├── 07-risk-management.md    ← 리스크 관리
 ├── 08-execution.md          ← 매매 실행 (Paper → 실거래)
 ├── 09-monitoring.md         ← 모니터링 & 알림
-└── 10-stock-universe.md     ← 종목 유니버스 관리
+├── 10-stock-universe.md     ← 종목 유니버스 관리
+└── 11-testing.md            ← 테스트 전략 & CI/CD
 
 config/
-└── settings.yaml            ← 시스템 설정 파일 (템플릿)
+├── settings.yaml            ← 시스템 설정 파일 (템플릿)
+└── prompts/                 ← LangGraph Agent 시스템 프롬프트
+    ├── news_agent.txt
+    ├── technical_agent.txt
+    ├── regime_agent.txt
+    ├── portfolio_agent.txt
+    └── briefing_system.txt
 ```
 
 ## 실행 단계 및 병렬 트랙

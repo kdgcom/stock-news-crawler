@@ -850,6 +850,7 @@ class ComparisonRunner:
 ### 4) 추천과 실행 분리
 - 매도 제안은 `recommendation`으로 저장하고 즉시 주문하지 않는다.
 - 사용자 확인 후에만 Execution 레이어에 주문 요청을 전달한다.
+
 ## Trade Ledger Update (2026-02-16)
 
 ### 보유종목 한정 매도 제안 규칙
@@ -864,4 +865,579 @@ for symbol in market_universe:
     if symbol not in holdings:
         continue  # 매도 제안 금지
     recommendation = build_sell_recommendation(symbol, holdings[symbol])
+```
+
+---
+
+## LangGraph Integration (2026-02-17)
+
+> Hybrid Agent Overlay의 핵심 오케스트레이션을 LangGraph StateGraph로 구현한다.
+
+### 적용 범위
+
+LangGraph는 **분석 엔진의 Hybrid 실행 플로우 전체**를 하나의 StateGraph로 표현한다.
+기존 수치 엔진(AlgorithmRouter, EnsembleRunner)은 그래프의 **노드 함수** 안에서 호출되며,
+LangGraph는 그 위의 **오케스트레이션 레이어**로 동작한다.
+
+```
+기존 코드 (유지)          LangGraph (신규 레이어)
+─────────────────       ──────────────────────────────────
+BaseAlgorithm            AnalysisGraph (StateGraph)
+AlgorithmRouter     →      ├── numeric_node (기존 코드 호출)
+EnsembleRunner             ├── trigger_node
+Signal, Context            ├── agent_fan_out (4종 병렬)
+                           ├── fusion_node
+                           ├── decision_node
+                           └── risk_gate_node
+```
+
+### AnalysisState 정의
+
+```python
+from typing import TypedDict, Annotated
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+import operator
+
+class AnalysisState(TypedDict):
+    """그래프 전체에서 공유되는 상태"""
+    # --- 입력 ---
+    symbol: str
+    market: str
+    context: dict                          # AlgorithmContext 직렬화
+
+    # --- Numeric Stage 결과 ---
+    numeric_score: float                   # 앙상블 점수 (-1 ~ +1)
+    numeric_decision: str                  # BUY / SELL / HOLD
+    numeric_confidence: float
+    member_signals: list[dict]             # 개별 알고리즘 결과
+
+    # --- Trigger Check ---
+    agent_required: bool                   # Agent 호출 필요 여부
+    trigger_reasons: list[str]             # 트리거 사유
+
+    # --- Agent Stage 결과 ---
+    agent_news_result: dict | None
+    agent_technical_result: dict | None
+    agent_regime_result: dict | None
+    agent_portfolio_result: dict | None
+    agent_score: float | None
+    agent_confidence: float | None
+
+    # --- Fusion ---
+    alpha: float                           # 동적 alpha
+    final_score: float
+    final_decision: str
+    final_confidence: float
+
+    # --- Risk Gate ---
+    risk_passed: bool
+    risk_reason: str
+    action: str                            # EXECUTE / HOLD / BLOCKED
+
+    # --- 메타 ---
+    decision_id: str                       # UUID (감사 추적)
+    created_at: str                        # ISO 8601
+    errors: Annotated[list[str], operator.add]  # 누적 오류
+```
+
+### 그래프 구조
+
+```
+                    ┌─────────────────────────────────────────────────┐
+                    │            AnalysisGraph                        │
+                    │                                                 │
+  START ──→ [numeric_node] ──→ [trigger_node] ──┬──→ [fusion_node]  │
+                                                │         │          │
+                          agent_required=True    │         │          │
+                          ┌─────────────────────┘         │          │
+                          ▼                               │          │
+                  [agent_fan_out]                          │          │
+                   ┌────┬────┬────┐                       │          │
+                   │    │    │    │                        ▼          │
+                [news][tech][reg][port]         [decision_node]      │
+                   │    │    │    │                        │          │
+                   └────┴────┴────┘                       ▼          │
+                  [agent_fan_in] ──────────→     [risk_gate_node]    │
+                                                          │          │
+                                                          ▼          │
+                                                        END          │
+                    └─────────────────────────────────────────────────┘
+```
+
+### 노드 구현
+
+#### 1. numeric_node — 수치 엔진 실행
+
+```python
+def numeric_node(state: AnalysisState) -> dict:
+    """기존 AlgorithmRouter/EnsembleRunner를 호출하여 numeric_score 산출"""
+    ctx = deserialize_context(state["context"])
+    router = AlgorithmRouter(config)
+    signal = router.run(ctx)
+
+    return {
+        "numeric_score": signal.score,
+        "numeric_decision": signal.decision,
+        "numeric_confidence": signal.confidence,
+        "member_signals": [
+            {"algorithm": s.algorithm, "decision": s.decision,
+             "score": s.score, "weight": w}
+            for s, w in signal.details.get("member_signals", [])
+        ],
+    }
+```
+
+#### 2. trigger_node — Agent 호출 판정
+
+```python
+def trigger_node(state: AnalysisState) -> dict:
+    """Agent 호출이 필요한 상황인지 판정"""
+    score = state["numeric_score"]
+    cfg = config.analysis.hybrid.agent_trigger
+    reasons = []
+
+    # 임계값 근접: 매수/매도 경계에서 판단이 애매한 경우
+    buy_th = config.analysis.signal.buy_threshold
+    sell_th = config.analysis.signal.sell_threshold
+    margin = cfg.near_threshold_margin
+
+    if abs(score - buy_th) < margin:
+        reasons.append("NEAR_BUY_THRESHOLD")
+    if abs(score - sell_th) < margin:
+        reasons.append("NEAR_SELL_THRESHOLD")
+
+    # 신호 충돌: 감성 vs 기술 방향 불일치
+    members = state["member_signals"]
+    sm = next((m for m in members if m["algorithm"] == "sentiment_momentum"), None)
+    tf = next((m for m in members if m["algorithm"] == "technical_trend"), None)
+    if sm and tf and sm["score"] * tf["score"] < 0:
+        reasons.append("SIGNAL_CONFLICT")
+
+    # 고영향 이벤트 감지
+    ctx = deserialize_context(state["context"])
+    for news in ctx.news_events:
+        if news.get("event_type") in cfg.high_impact_event_types:
+            reasons.append(f"HIGH_IMPACT:{news['event_type'].upper()}")
+            break
+
+    return {
+        "agent_required": len(reasons) > 0,
+        "trigger_reasons": reasons,
+    }
+```
+
+#### 3. agent_fan_out — 4종 전문 Agent 병렬 실행
+
+```python
+from langgraph.graph import Send
+
+def agent_fan_out(state: AnalysisState) -> list[Send]:
+    """4종 Agent를 병렬로 dispatch"""
+    return [
+        Send("agent_news",      state),
+        Send("agent_technical",  state),
+        Send("agent_regime",     state),
+        Send("agent_portfolio",  state),
+    ]
+```
+
+각 Agent 노드는 LLM을 호출하여 구조화된 판단을 반환한다:
+
+```python
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import PydanticOutputParser
+from pydantic import BaseModel, Field
+
+class AgentJudgment(BaseModel):
+    """Agent가 반환하는 구조화된 판단"""
+    direction: str = Field(description="BUY / SELL / HOLD")
+    score: float = Field(ge=-1.0, le=1.0)
+    confidence: float = Field(ge=0.0, le=1.0)
+    reasoning: str
+    key_factors: list[str]
+
+# --- News Agent ---
+def agent_news(state: AnalysisState) -> dict:
+    """뉴스 맥락을 LLM으로 심층 분석"""
+    ctx = deserialize_context(state["context"])
+    parser = PydanticOutputParser(pydantic_object=AgentJudgment)
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", NEWS_AGENT_SYSTEM_PROMPT),
+        ("human", """
+종목: {symbol} ({market})
+현재 수치 엔진 점수: {numeric_score}
+최근 뉴스 {news_count}건:
+{news_summary}
+
+위 뉴스를 종합하여 매매 판단을 내려주세요.
+{format_instructions}
+"""),
+    ])
+
+    chain = prompt | llm_fast | parser
+    try:
+        result = chain.invoke({
+            "symbol": state["symbol"],
+            "market": state["market"],
+            "numeric_score": state["numeric_score"],
+            "news_count": len(ctx.news_events),
+            "news_summary": format_news_for_llm(ctx.news_events[:10]),
+            "format_instructions": parser.get_format_instructions(),
+        })
+        return {"agent_news_result": result.model_dump()}
+    except Exception as e:
+        return {"agent_news_result": None, "errors": [f"NEWS_AGENT_ERROR: {e}"]}
+
+
+# --- Technical Agent ---
+def agent_technical(state: AnalysisState) -> dict:
+    """기술 지표 패턴을 LLM으로 해석"""
+    ctx = deserialize_context(state["context"])
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", TECHNICAL_AGENT_SYSTEM_PROMPT),
+        ("human", """
+종목: {symbol} | RSI: {rsi} | MACD: {macd} | 볼린저 위치: {bb_pos}
+SMA20: {sma20} vs SMA50: {sma50} | 거래량 비율: {vol_ratio}
+최근 5분봉 20개: {bars_summary}
+{format_instructions}
+"""),
+    ])
+    chain = prompt | llm_fast | parser
+    try:
+        result = chain.invoke(build_technical_context(ctx, state))
+        return {"agent_technical_result": result.model_dump()}
+    except Exception as e:
+        return {"agent_technical_result": None, "errors": [f"TECH_AGENT_ERROR: {e}"]}
+
+
+# --- Regime Agent ---
+def agent_regime(state: AnalysisState) -> dict:
+    """현재 시장 체제를 판단하고 적합한 전략 제안"""
+    ctx = deserialize_context(state["context"])
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", REGIME_AGENT_SYSTEM_PROMPT),
+        ("human", """
+시장: {market} | VIX: {vix} | 현재 체제 판정: {regime}
+KOSPI/S&P 최근 추이: {index_summary}
+수치 엔진 체제 판정과 당신의 판정이 다르면 그 이유를 설명하세요.
+{format_instructions}
+"""),
+    ])
+    chain = prompt | llm_fast | parser
+    try:
+        result = chain.invoke(build_regime_context(ctx, state))
+        return {"agent_regime_result": result.model_dump()}
+    except Exception as e:
+        return {"agent_regime_result": None, "errors": [f"REGIME_AGENT_ERROR: {e}"]}
+
+
+# --- Portfolio Agent ---
+def agent_portfolio(state: AnalysisState) -> dict:
+    """보유 포지션 맥락에서 신규 진입/추가/축소 판단"""
+    ctx = deserialize_context(state["context"])
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", PORTFOLIO_AGENT_SYSTEM_PROMPT),
+        ("human", """
+종목: {symbol} | 보유 여부: {has_position}
+포지션: 수량 {qty}, 평단 {avg_cost}, 수익률 {pnl_pct}%
+포트폴리오: 현금비율 {cash_pct}%, 보유 {pos_count}종목
+리스크 여력: 일일 {daily_remaining}%, 주간 {weekly_remaining}%
+{format_instructions}
+"""),
+    ])
+    chain = prompt | llm_fast | parser
+    try:
+        result = chain.invoke(build_portfolio_context(ctx, state))
+        return {"agent_portfolio_result": result.model_dump()}
+    except Exception as e:
+        return {"agent_portfolio_result": None, "errors": [f"PORT_AGENT_ERROR: {e}"]}
+```
+
+#### 4. agent_fan_in — Agent 결과 집계
+
+```python
+def agent_fan_in(state: AnalysisState) -> dict:
+    """4종 Agent 결과를 하나의 agent_score로 합산"""
+    results = []
+    weights = config.analysis.langgraph.agent_weights
+
+    for key, weight_key in [
+        ("agent_news_result",      "news"),
+        ("agent_technical_result", "technical"),
+        ("agent_regime_result",    "regime"),
+        ("agent_portfolio_result", "portfolio"),
+    ]:
+        result = state.get(key)
+        if result is not None:
+            results.append((result["score"], result["confidence"], weights[weight_key]))
+
+    if not results:
+        # 모든 Agent 실패 → fallback
+        return {
+            "agent_score": None,
+            "agent_confidence": None,
+            "errors": ["ALL_AGENTS_FAILED"],
+        }
+
+    # 신뢰도 가중 평균
+    weighted_sum = sum(s * c * w for s, c, w in results)
+    total_weight = sum(c * w for _, c, w in results)
+    agent_score = weighted_sum / total_weight if total_weight > 0 else 0
+    agent_confidence = sum(c * w for _, c, w in results) / sum(w for _, _, w in results)
+
+    return {
+        "agent_score": agent_score,
+        "agent_confidence": agent_confidence,
+    }
+```
+
+#### 5. fusion_node — 수치 + Agent 점수 융합
+
+```python
+def fusion_node(state: AnalysisState) -> dict:
+    """numeric_score와 agent_score를 alpha 블렌딩으로 합산"""
+    numeric = state["numeric_score"]
+
+    # Agent를 호출하지 않았거나 전부 실패한 경우
+    if not state["agent_required"] or state.get("agent_score") is None:
+        return {
+            "alpha": 1.0,
+            "final_score": numeric,
+            "final_confidence": state["numeric_confidence"],
+        }
+
+    agent = state["agent_score"]
+
+    # 동적 alpha 결정
+    alpha = compute_dynamic_alpha(state)
+
+    final_score = alpha * numeric + (1 - alpha) * agent
+    final_confidence = (
+        alpha * state["numeric_confidence"] +
+        (1 - alpha) * state["agent_confidence"]
+    )
+
+    return {
+        "alpha": alpha,
+        "final_score": final_score,
+        "final_confidence": final_confidence,
+    }
+
+
+def compute_dynamic_alpha(state: AnalysisState) -> float:
+    """시장 상황에 따라 alpha를 동적 조정"""
+    cfg = config.analysis.hybrid
+    ctx = deserialize_context(state["context"])
+
+    # 기본값
+    alpha = cfg.alpha_default  # 0.7
+
+    # VIX 높거나 변동성 과열 → agent 비중 증가 (alpha 감소)
+    if ctx.regime == "volatile":
+        alpha = min(alpha, cfg.alpha_volatile)  # 0.5
+
+    # 뉴스 급증 구간 → agent 비중 증가
+    if len(ctx.news_events) > 10:
+        alpha = min(alpha, cfg.alpha_news_spike)  # 0.4
+
+    # Agent 자체 신뢰도가 낮으면 → numeric 신뢰 (alpha 증가)
+    if state.get("agent_confidence", 0) < 0.4:
+        alpha = max(alpha, 0.85)
+
+    return alpha
+```
+
+#### 6. decision_node — 최종 결정
+
+```python
+def decision_node(state: AnalysisState) -> dict:
+    """final_score → BUY/SELL/HOLD 결정"""
+    score = state["final_score"]
+    buy_th = config.analysis.signal.buy_threshold
+    sell_th = config.analysis.signal.sell_threshold
+
+    if score >= buy_th:
+        decision = "BUY"
+    elif score <= sell_th:
+        decision = "SELL"
+    else:
+        decision = "HOLD"
+
+    return {"final_decision": decision}
+```
+
+#### 7. risk_gate_node — 리스크 게이트
+
+```python
+def risk_gate_node(state: AnalysisState) -> dict:
+    """07-risk-management의 3계층 리스크 체크를 실행"""
+    if state["final_decision"] == "HOLD":
+        return {"risk_passed": True, "risk_reason": "HOLD_NO_CHECK", "action": "HOLD"}
+
+    ctx = deserialize_context(state["context"])
+    signal = {
+        "symbol": state["symbol"],
+        "market": state["market"],
+        "decision": state["final_decision"],
+        "score": state["final_score"],
+    }
+
+    passed, reason = risk_gate.check(signal, ctx.portfolio)
+
+    if passed:
+        action = "EXECUTE"
+    else:
+        action = "BLOCKED"
+
+    return {"risk_passed": passed, "risk_reason": reason, "action": action}
+```
+
+### 그래프 빌드
+
+```python
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+def build_analysis_graph() -> StateGraph:
+    graph = StateGraph(AnalysisState)
+
+    # 노드 등록
+    graph.add_node("numeric",        numeric_node)
+    graph.add_node("trigger",        trigger_node)
+    graph.add_node("agent_news",     agent_news)
+    graph.add_node("agent_technical", agent_technical)
+    graph.add_node("agent_regime",   agent_regime)
+    graph.add_node("agent_portfolio", agent_portfolio)
+    graph.add_node("agent_fan_in",   agent_fan_in)
+    graph.add_node("fusion",         fusion_node)
+    graph.add_node("decision",       decision_node)
+    graph.add_node("risk_gate",      risk_gate_node)
+
+    # 엣지 연결
+    graph.add_edge(START, "numeric")
+    graph.add_edge("numeric", "trigger")
+
+    # 조건부 분기: Agent 필요 여부
+    graph.add_conditional_edges(
+        "trigger",
+        lambda s: "agent" if s["agent_required"] else "skip",
+        {
+            "agent": "agent_news",      # Agent fan-out 시작
+            "skip":  "fusion",           # Agent 건너뜀
+        },
+    )
+
+    # Agent 4종 병렬 → fan-in
+    # (LangGraph의 Send API 또는 동일 입력 노드 병렬 배치)
+    for agent_node in ["agent_news", "agent_technical", "agent_regime", "agent_portfolio"]:
+        graph.add_edge("trigger", agent_node)    # trigger → 4종 동시
+        graph.add_edge(agent_node, "agent_fan_in")
+
+    graph.add_edge("agent_fan_in", "fusion")
+    graph.add_edge("fusion", "decision")
+    graph.add_edge("decision", "risk_gate")
+    graph.add_edge("risk_gate", END)
+
+    # 체크포인터 (SQLite — VM 로컬)
+    checkpointer = SqliteSaver.from_conn_string("data/langgraph_checkpoints.db")
+
+    return graph.compile(checkpointer=checkpointer)
+
+
+# 사용
+analysis_graph = build_analysis_graph()
+
+result = analysis_graph.invoke(
+    {
+        "symbol": "005930",
+        "market": "KR",
+        "context": serialize_context(ctx),
+        "decision_id": str(uuid4()),
+        "created_at": datetime.utcnow().isoformat(),
+        "errors": [],
+    },
+    config={"configurable": {"thread_id": f"005930-KR-{timestamp}"}},
+)
+
+# result["action"] == "EXECUTE" | "HOLD" | "BLOCKED"
+```
+
+### Agent 프롬프트 관리
+
+Agent 시스템 프롬프트는 별도 파일로 관리하여 코드 변경 없이 조정한다:
+
+```
+config/prompts/
+├── news_agent.txt          ← NEWS_AGENT_SYSTEM_PROMPT
+├── technical_agent.txt     ← TECHNICAL_AGENT_SYSTEM_PROMPT
+├── regime_agent.txt        ← REGIME_AGENT_SYSTEM_PROMPT
+└── portfolio_agent.txt     ← PORTFOLIO_AGENT_SYSTEM_PROMPT
+```
+
+각 프롬프트는 다음 원칙을 따른다:
+- **역할 명시**: "당신은 {역할} 전문 분석가입니다"
+- **출력 형식 강제**: AgentJudgment Pydantic 스키마 준수
+- **범위 제한**: 자기 영역 외 판단 금지 (News Agent는 기술 지표 언급 금지)
+- **근거 필수**: reasoning 필드에 판단 근거 3줄 이상
+
+### 체크포인팅 & 재시도 전략
+
+```python
+# 체크포인터: SQLite (VM 로컬 디스크)
+# - 장애 발생 시 마지막 성공 노드부터 재개
+# - thread_id = "{symbol}-{market}-{timestamp}"로 각 분석 건 격리
+
+# 노드별 타임아웃
+TIMEOUT_CONFIG = {
+    "numeric":    5_000,    # 5초 (수치 계산)
+    "trigger":    1_000,    # 1초 (규칙 판정)
+    "agent_*":    3_000,    # 3초 (LLM API 호출) — settings.yaml 연동
+    "fusion":     1_000,    # 1초
+    "decision":     500,    # 0.5초
+    "risk_gate":  1_000,    # 1초
+}
+
+# Agent 노드 타임아웃 시 → 해당 Agent 결과를 None으로 처리
+# 모든 Agent 실패 시 → agent_score = None → fusion에서 numeric_only 폴백
+```
+
+### 감사 로그 자동 기록
+
+LangGraph의 실행 결과를 BigQuery `decision_logs`에 자동 저장:
+
+```python
+def save_decision_log(result: AnalysisState):
+    """그래프 실행 결과 전체를 감사 로그로 기록"""
+    log = {
+        "decision_id": result["decision_id"],
+        "ts_utc": result["created_at"],
+        "symbol": result["symbol"],
+        "market": result["market"],
+        # Numeric
+        "numeric_score": result["numeric_score"],
+        "numeric_decision": result["numeric_decision"],
+        "member_signals": result["member_signals"],
+        # Agent
+        "agent_required": result["agent_required"],
+        "trigger_reasons": result["trigger_reasons"],
+        "agent_news": result.get("agent_news_result"),
+        "agent_technical": result.get("agent_technical_result"),
+        "agent_regime": result.get("agent_regime_result"),
+        "agent_portfolio": result.get("agent_portfolio_result"),
+        "agent_score": result.get("agent_score"),
+        # Fusion
+        "alpha": result["alpha"],
+        "final_score": result["final_score"],
+        "final_decision": result["final_decision"],
+        # Risk
+        "risk_passed": result["risk_passed"],
+        "risk_reason": result["risk_reason"],
+        "action": result["action"],
+        # Meta
+        "errors": result["errors"],
+        "graph_version": "analysis_v1",
+    }
+    bigquery_client.insert_rows_json("decision_logs", [log])
 ```

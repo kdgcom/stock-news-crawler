@@ -196,6 +196,43 @@ storage:
     news_sentiment_daily: "permanent"
 
 # ---------------------------------------------------------------------------
+# LangGraph — Agent 오케스트레이션
+# ---------------------------------------------------------------------------
+langgraph:
+  # 체크포인터
+  checkpoint:
+    backend: "sqlite"                    # sqlite | postgres (Phase 3)
+    sqlite_path: "data/langgraph_checkpoints.db"
+
+  # AnalysisGraph (06-analysis-engine)
+  analysis_graph:
+    enabled: true
+    agent_timeout_ms: 3000               # 개별 Agent 노드 타임아웃
+    agent_weights:                       # Agent 결과 합산 가중치
+      news: 0.35
+      technical: 0.25
+      regime: 0.15
+      portfolio: 0.25
+    llm_provider: "claude"               # claude | gemini
+    llm_model: "haiku"                   # Agent 호출용 모델 (비용 절약)
+    prompts_dir: "config/prompts/"       # 시스템 프롬프트 파일 경로
+    max_retries_per_node: 2
+
+  # BriefingGraph (05-pre-market)
+  briefing_graph:
+    enabled: true
+    collection_timeout_ms: 30000         # 수집 노드 타임아웃 (30초)
+    llm_model: "haiku"                   # 브리핑 생성용 모델
+    partial_briefing_on_failure: true    # 일부 수집 실패 시 부분 브리핑 생성
+
+  # SellApprovalGraph (08-execution)
+  sell_approval_graph:
+    enabled: true
+    approval_timeout_hours: 48           # 승인 대기 최대 시간
+    expire_check_cron: "0 * * * *"       # 매시간 만료 체크
+    notify_reminder_hours: 24            # 24시간 미승인 시 리마인드
+
+# ---------------------------------------------------------------------------
 # 분석 엔진 — 공통 설정
 # ---------------------------------------------------------------------------
 analysis:

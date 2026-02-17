@@ -1,0 +1,453 @@
+# =============================================================================
+# Stock Trading System - Configuration
+# =============================================================================
+# 이 파일을 config/settings.local.yaml로 복사하여 실제 값을 입력하세요.
+# settings.local.yaml은 .gitignore에 포함되어 Git에 커밋되지 않습니다.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Google Cloud Platform
+# ---------------------------------------------------------------------------
+gcp:
+  account_email: ""                    # GCP 계정 이메일
+  project_id: ""                       # GCP 프로젝트 ID
+  region: "us-central1"                # 무료 티어 대상 리전
+  credentials_path: "./config/gcp-service-account.json"
+
+  bigquery:
+    dataset: "stock_trading"
+    location: "US"                     # 멀티리전 (무료 티어)
+
+  cloud_run:
+    region: "us-central1"
+    max_instances: 3
+    timeout_seconds: 300
+
+  cloud_storage:
+    bucket: ""                         # 뉴스 아카이브 버킷명
+    archive_prefix: "news_archive/"
+
+  cloud_scheduler:
+    timezone: "Asia/Seoul"
+
+  compute_engine:
+    zone: "us-central1-a"             # f1-micro/e2-micro 무료 대상
+    machine_type: "e2-micro"
+
+# ---------------------------------------------------------------------------
+# MongoDB Atlas
+# ---------------------------------------------------------------------------
+mongodb:
+  atlas_uri: ""                        # mongodb+srv://...
+  database: "stock_news"
+  collections:
+    raw_news: "raw_news_events"
+    enriched_news: "enriched_news_events"
+  archive_after_days: 90               # raw 원문 아카이브 기준일
+
+# ---------------------------------------------------------------------------
+# Redis
+# ---------------------------------------------------------------------------
+redis:
+  host: "localhost"                    # VM 내 Redis 또는 Upstash
+  port: 6379
+  password: ""
+  # Upstash 사용 시:
+  # host: "xxx.upstash.io"
+  # port: 6379
+  # password: "xxx"
+  cache_ttl_seconds: 1800             # 시세 캐시 30분
+  news_cache_ttl_seconds: 3600        # 뉴스 감성 캐시 1시간
+
+# ---------------------------------------------------------------------------
+# 시장 설정
+# ---------------------------------------------------------------------------
+markets:
+  kr:
+    enabled: true
+    timezone: "Asia/Seoul"
+    trading_hours:
+      open: "09:00"
+      close: "15:30"
+    pre_market_scan_time: "07:30"      # 장전 스캔 시작
+    post_market_time: "16:00"          # 장후 정리 시작
+    collection_interval_minutes: 5
+    news_sources:
+      - name: "naver_finance"
+        enabled: true
+        interval_minutes: 5
+      - name: "dart"
+        enabled: true
+        interval_minutes: 10
+
+  us:
+    enabled: true
+    timezone: "America/New_York"
+    trading_hours:
+      open: "09:30"
+      close: "16:00"
+    # KST 기준 시간 (참고용)
+    pre_market_scan_time_kst: "22:00"
+    post_market_time_kst: "07:00"
+    collection_interval_minutes: 5
+    news_sources:
+      - name: "alpaca_news"
+        enabled: true
+        interval_minutes: 5
+      - name: "sec_edgar"
+        enabled: true
+        interval_minutes: 30
+
+# ---------------------------------------------------------------------------
+# 종목 유니버스
+# ---------------------------------------------------------------------------
+universe:
+  tier1:
+    kr:
+      max_count: 30
+      min_market_cap_rank: 50
+      min_daily_trading_value_krw: 10_000_000_000   # 100억
+      max_per_sector: 5
+      symbols:                         # 초기 수동 지정 (빈 배열이면 자동 선정)
+        # - "005930"  # 삼성전자
+        # - "000660"  # SK하이닉스
+    us:
+      max_count: 30
+      min_market_cap_rank: 50
+      min_daily_volume: 5_000_000
+      max_per_sector: 5
+      symbols:
+        # - "AAPL"
+        # - "MSFT"
+
+  tier2:
+    kr:
+      max_count: 50
+      min_market_cap_rank: 100
+      min_daily_trading_value_krw: 5_000_000_000    # 50억
+    us:
+      max_count: 50
+      min_market_cap_rank: 100
+      min_daily_volume: 2_000_000
+
+  promotion:                           # Tier 2 → Tier 1 승격 조건
+    news_spike_ratio: 3.0              # 평소 대비 뉴스 3배
+    volume_spike_ratio: 3.0            # 5일 평균 대비 거래량 3배
+    volatility_top_pct: 10             # 변동성 상위 10%
+    earnings_days_before: 7            # 실적 발표 D-7
+
+  demotion:                            # Tier 1 → Tier 2 강등 조건
+    no_signal_days: 30
+    low_volume_consecutive_days: 10
+    post_position_cooldown_days: 7
+
+# ---------------------------------------------------------------------------
+# 데이터 수집
+# ---------------------------------------------------------------------------
+collection:
+  price:
+    interval_minutes: 5                # 시세 수집 주기
+    bars_per_fetch: 5                  # 5분봉 1개 = 5분 간격
+    derived_fields: true               # 파생 필드 계산 (high_minute, low_minute 등)
+    retry_max: 5
+    retry_backoff_seconds: 2
+
+  news:
+    interval_minutes: 5
+    pre_market_lookback_hours: 12      # 장전 스캔 시 과거 12시간
+    dedup_window_hours: 24             # 중복 판정 윈도우
+    max_body_length: 5000              # 본문 최대 글자수
+
+# ---------------------------------------------------------------------------
+# 데이터 저장 주기
+# ---------------------------------------------------------------------------
+storage:
+  realtime:                            # 장중 5분마다
+    price_to_bigquery: true            # GCS → BigQuery 배치 로드
+    price_to_redis_cache: true         # 최근 200바 캐시
+    news_to_mongodb: true              # raw + enriched
+    news_sentiment_to_redis: true      # 감성 캐시 (TTL 30분)
+
+  post_market:                         # 장 마감 후
+    daily_bars_aggregate: true         # BigQuery Scheduled Query
+    positions_snapshot: true           # Redis → BigQuery
+    daily_pnl_calculate: true
+    news_sentiment_daily: true         # 일별 감성 집계
+    tier3_screening: true              # 전체 시장 스크리닝
+    universe_rebalance: true           # 승격/강등 판정
+    daily_report: true                 # 일일 리포트 발송
+
+  weekly:
+    performance_summary: true          # 주간 성과 요약
+    risk_review: true                  # 리스크 지표 리뷰
+
+  monthly:
+    news_archive: true                 # 3개월 이상 raw → GCS 압축
+    cost_audit: true                   # GCP/LLM 비용 점검
+
+  retention:
+    price_5m_bars_months: 12           # 5분봉 보존 기간
+    daily_bars: "permanent"            # 일봉 영구 보존
+    news_raw_mongodb_days: 90          # MongoDB raw 보존
+    news_enriched: "permanent"         # enriched 영구 보존
+    news_archive_gcs_years: 5          # GCS 아카이브 보존
+    decision_logs: "permanent"         # 의사결정 로그 영구
+    news_sentiment_hourly_months: 12
+    news_sentiment_daily: "permanent"
+
+# ---------------------------------------------------------------------------
+# 분석 엔진 — 공통 설정
+# ---------------------------------------------------------------------------
+analysis:
+  technical:
+    rsi_period: 14
+    sma_short: 20
+    sma_long: 50
+    macd_fast: 12
+    macd_slow: 26
+    macd_signal: 9
+    bollinger_period: 20
+    bollinger_std: 2.0
+    volume_spike_ratio: 2.0
+    atr_period: 14
+    obv_enabled: true
+
+  sentiment:
+    phase: 1                           # 1: 키워드, 2: LLM
+    keyword_weight_headline: 0.7
+    keyword_weight_body: 0.3
+    min_confidence: 0.6
+    llm_provider: "claude"
+    llm_model_fast: "haiku"
+    llm_model_verify: "sonnet"
+
+  signal:
+    buy_threshold: 0.6
+    sell_threshold: -0.6
+    hold_default: true
+
+# ---------------------------------------------------------------------------
+# 알고리즘 설정
+# ---------------------------------------------------------------------------
+algorithms:
+  # 활성 알고리즘 (단일 이름 또는 "ensemble")
+  active: "ensemble"
+
+  # --- 개별 알고리즘 ---
+
+  # [SM] Sentiment Momentum — 감성 변화 추세 추종
+  sentiment_momentum:
+    enabled: true
+    lookback_hours: 24               # 감성 변화 측정 기간
+    change_threshold: 0.3            # |변화| > 0.3 이면 신호
+    decay_factor: 0.9                # 오래된 뉴스 감쇠 (시간당)
+    min_articles: 3                  # 최소 기사 수 미만 → HOLD
+    weight_novelty: 0.3              # novelty_score 가중
+    weight_reliability: 0.3          # reliability_score 가중
+    weight_sentiment: 0.4            # sentiment_score 가중
+
+  # [TF] Technical Trend — 기술적 추세 추종
+  technical_trend:
+    enabled: true
+    entry_conditions:                # AND 조건 (모두 충족 시 진입)
+      sma_cross: true                # SMA 20/50 골든/데드크로스
+      macd_confirm: true             # MACD 히스토그램 방향 확인
+      volume_confirm: true           # 거래량 평균 1.5배 이상
+    exit_conditions:
+      sma_reverse: true              # SMA 역전 시 청산
+      macd_divergence: true          # MACD 다이버전스 시 청산
+    atr_stop_multiplier: 2.0         # ATR 기반 손절 (2 × ATR)
+
+  # [MR] Mean Reversion — 평균 회귀
+  mean_reversion:
+    enabled: true
+    rsi_oversold: 30                 # RSI < 30 → 매수 후보
+    rsi_overbought: 70               # RSI > 70 → 매도 후보
+    bollinger_entry: 1.0             # 하단 밴드 ± 1σ 진입
+    bollinger_exit: 0.0              # 중심선 복귀 시 청산
+    max_hold_bars: 60                # 최대 보유 (60 × 5분 = 5시간)
+    require_volume_divergence: true  # 거래량 감소 + 가격 하락 = 매수
+
+  # [EC] Event Catalyst — 이벤트 기반
+  event_catalyst:
+    enabled: true
+    event_weights:                   # 이벤트별 기대 방향/강도
+      earnings_beat:      0.8        # 실적 상회 → 강한 매수
+      earnings_miss:     -0.8        # 실적 하회 → 강한 매도
+      guidance_up:        0.6        # 가이던스 상향
+      guidance_down:     -0.6
+      m_and_a_acquirer:  -0.3        # 인수자 → 약한 매도 (프리미엄 지불)
+      m_and_a_target:     0.7        # 피인수자 → 강한 매수
+      dividend_increase:  0.4
+      regulation_negative: -0.5
+      product_launch:     0.3
+      lawsuit_filed:     -0.4
+    reaction_window_minutes: 30      # 이벤트 후 반응 윈도우
+    min_event_confidence: 0.7        # 이벤트 분류 신뢰도 하한
+    fade_after_hours: 4              # N시간 후 시그널 소멸
+
+  # [VP] Volume-Price Divergence — 거래량-가격 괴리
+  volume_price:
+    enabled: true
+    accumulation:                    # 세력 매집 감지
+      price_change_max_pct: 0.005    # 가격 변화 < 0.5% (횡보)
+      volume_surge_ratio: 2.5        # 거래량 2.5배 이상 → 매집 의심
+      consecutive_bars: 3            # 3연속 봉 이상
+    distribution:                    # 세력 분배 감지
+      price_up_pct: 0.01             # 가격 상승 중
+      volume_decline_ratio: 0.6      # 거래량 40% 감소 → 분배 의심
+    obv_divergence_bars: 20          # OBV 다이버전스 판정 기간
+
+  # [OG] Overnight Gap — 장전 갭 전략
+  overnight_gap:
+    enabled: true
+    min_gap_pct: 0.02                # 최소 갭 2%
+    gap_fill_mode: true              # true: 갭 메움 방향, false: 갭 추종
+    sentiment_confirm: true          # 뉴스 감성이 갭 방향과 일치해야 추종
+    entry_delay_bars: 2              # 장 시작 후 2봉(10분) 관찰 후 진입
+    max_hold_bars: 24                # 최대 보유 (24 × 5분 = 2시간)
+
+  # [SC] Sector Correlation — 섹터/테마 연동
+  sector_correlation:
+    enabled: true
+    leader_lag_bars: 6               # 리더 종목 선행 시간 (30분)
+    min_correlation: 0.7             # 상관계수 하한
+    sector_momentum_window: 12       # 섹터 모멘텀 윈도우 (1시간)
+    max_sector_exposure: 0.3         # 섹터 최대 노출 (리스크 한도와 연동)
+
+  # [RA] Regime-Adaptive — 시장 체제 적응형
+  regime_adaptive:
+    enabled: true
+    regime_detection:
+      method: "volatility_sma"       # volatility_sma | hmm (Phase 3)
+      volatility_window: 20          # 변동성 측정 윈도우 (일봉)
+      trend_window: 50               # 추세 판정 윈도우 (일봉)
+    regime_algorithm_map:            # 체제별 최적 알고리즘
+      trending_up: "technical_trend"
+      trending_down: "technical_trend"
+      sideways: "mean_reversion"
+      volatile: "event_catalyst"
+      low_volatility: "sentiment_momentum"
+
+  # --- 앙상블 설정 ---
+  ensemble:
+    mode: "weighted_vote"            # weighted_vote | majority_vote | best_confidence | stack
+    members:                         # 앙상블 참여 알고리즘 + 가중치
+      - algorithm: "sentiment_momentum"
+        weight: 0.20
+      - algorithm: "technical_trend"
+        weight: 0.25
+      - algorithm: "mean_reversion"
+        weight: 0.15
+      - algorithm: "event_catalyst"
+        weight: 0.20
+      - algorithm: "volume_price"
+        weight: 0.10
+      - algorithm: "overnight_gap"
+        weight: 0.10
+    min_agreement: 0.5               # 가중 합의 50% 이상 시 실행
+    conflict_resolution: "hold"      # 의견 대립 시: hold | strongest | abstain
+
+  # --- Champion / Challenger 비교 ---
+  comparison:
+    enabled: false                   # true: 두 알고리즘 병렬 실행, 성과 비교
+    champion: "ensemble"             # 실제 매매
+    challenger: "regime_adaptive"    # Paper만 (shadow mode)
+    switch_after_days: 30            # N일 후 성과 비교 → 자동 교체 검토
+    switch_metric: "sharpe"          # sharpe | total_return | win_rate
+
+# ---------------------------------------------------------------------------
+# 리스크 관리
+# ---------------------------------------------------------------------------
+risk:
+  hard_limits:
+    max_single_order_krw: 5_000_000
+    max_single_order_usd: 3_000
+    max_orders_per_day: 50
+    max_daily_loss_pct: -0.03
+    max_weekly_loss_pct: -0.05
+    max_drawdown_pct: -0.15
+    max_single_stock_pct: 0.10
+    max_sector_pct: 0.30
+    max_total_positions: 20
+    min_cash_reserve_pct: 0.20
+
+  dynamic:
+    consecutive_loss_cooldown_hours: 1
+    consecutive_loss_count: 3
+    post_event_blackout_seconds: 30
+    max_spread_pct: 0.005
+    volatility_reduce_threshold: 0.8   # VIX/변동성 상위 20%
+
+  stop_loss:
+    fixed_pct: -0.05
+    trailing_pct: -0.03
+    time_days: 5
+    time_loss_pct: -0.02
+
+  kill_switch:
+    auto_triggers:
+      - "daily_loss_exceeded"
+      - "mdd_exceeded"
+      - "api_consecutive_failures: 5"
+      - "data_gap_minutes: 30"
+
+# ---------------------------------------------------------------------------
+# LLM 비용 관리
+# ---------------------------------------------------------------------------
+llm:
+  daily_budget_usd: 10.0
+  model_switch_threshold_usd: 7.0     # $7 도달 시 저비용 모델 전환
+  cache_identical_news: true
+
+# ---------------------------------------------------------------------------
+# 알림 (Telegram)
+# ---------------------------------------------------------------------------
+notification:
+  provider: "telegram"                 # telegram | discord
+  telegram:
+    bot_token: ""
+    chat_id: ""
+    # 알림 레벨 설정
+    send_daily_briefing: true
+    send_trade_signals: true
+    send_risk_alerts: true
+    send_kill_switch: true
+    send_weekly_report: true
+    quiet_hours:                       # 알림 무음 시간 (KST)
+      start: "00:00"
+      end: "06:00"
+
+  # Discord 대안
+  discord:
+    webhook_url: ""
+
+# ---------------------------------------------------------------------------
+# 브로커 API (Phase 3)
+# ---------------------------------------------------------------------------
+broker:
+  kr:
+    provider: "kis"                    # 한국투자증권
+    app_key: ""
+    app_secret: ""
+    account_no: ""
+    is_paper: true                     # true: 모의투자, false: 실거래
+  us:
+    provider: "alpaca"
+    api_key: ""
+    api_secret: ""
+    base_url: "https://paper-api.alpaca.markets"  # paper trading
+
+# ---------------------------------------------------------------------------
+# 모니터링
+# ---------------------------------------------------------------------------
+monitoring:
+  prometheus:
+    enabled: true
+    port: 9090
+  grafana:
+    enabled: true
+    cloud_url: ""                      # Grafana Cloud 무료 티어
+  health_check:
+    interval_seconds: 60
+    alert_after_failures: 3
